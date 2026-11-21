@@ -1,5 +1,5 @@
 // Parsers for frequencyplansatellites.altervista.org tables and PDF text.
-import { bandOf } from '../src/beacon.js';
+import { bandOf } from '../src/frequencies.js';
 
 const decode = (s) => s.replace(/&nbsp;/g, ' ').replace(/&deg;/g, '°').replace(/&amp;/g, '&').replace(/&#(\d+);/g, (_, n) => String.fromCharCode(n));
 const text = (html) => decode(html.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();

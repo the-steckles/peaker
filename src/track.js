@@ -94,18 +94,40 @@ export function createAutoPeak({ az, el, beamwidthDeg, radiusDeg, noiseDbm, dwel
   };
 }
 
-export function createStepTrack({ az, el, beamwidthDeg, noiseDbm, dwell = 2, lossMarginDb = 4 }) {
+// Runs one az/el cycle every intervalS (start to start), holding on the peak in between.
+export function createStepTrack({ az, el, beamwidthDeg, noiseDbm, dwell = 2, lossMarginDb = 4, intervalS = 0 }) {
   const scan = crossScan({ az, el }, beamwidthDeg / 4, dwell);
-  let phase = 'tracking', level = null;
+  const monitor = averager(dwell);
+  let phase = 'tracking', level = null, waiting = false, elapsed = 0, cycles = 0;
+  const setLevel = (v) => {
+    level = v;
+    phase = v < noiseDbm + lossMarginDb ? 'lost' : 'tracking';
+  };
   return {
     get phase() { return phase; },
     get level() { return level; },
-    target: () => scan.target(),
+    get cycles() { return cycles; },
+    get waiting() { return waiting; },
+    get nextInS() { return waiting ? Math.max(0, intervalS - elapsed) : 0; },
+    setIntervalS(s) { intervalS = s; },
+    target: () => (waiting ? scan.center() : scan.target()),
+    advance(dt) {
+      elapsed += dt;
+      if (waiting && elapsed >= intervalS) { waiting = false; elapsed = 0; }
+    },
     update(db) {
+      if (waiting) {
+        const v = monitor(db);
+        if (v !== null) setLevel(v);
+        return;
+      }
       const r = scan.feed(db);
       if (!r) return;
-      level = r.level;
-      phase = r.level < noiseDbm + lossMarginDb ? 'lost' : 'tracking';
+      setLevel(r.level);
+      if (r.axisDone) {
+        cycles++;
+        if (elapsed < intervalS) waiting = true; else elapsed = 0;
+      }
     },
   };
 }

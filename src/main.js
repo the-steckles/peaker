@@ -1,5 +1,5 @@
 import { beamwidthDeg, gainDbi, isModelReliable, offAxisDeg, peakGainDbi } from './antenna.js';
-import { BANDS, bandOf, bandsFor, resolveBeacons } from './beacon.js';
+import { BANDS, bandOf, bandsFor, resolveBeacons } from './frequencies.js';
 import { createWaterfall, drawPattern, drawSpectrum } from './display.js';
 import { TRANSPONDER_EIRP_DBW, atmosphericLossDb, beaconEirpDbw, computeTrace, dopplerHz, fsplDb, noiseDbm, peakNear, receivedDbm, systemTempK } from './link.js';
 import { isGeostationary, look, makeSatrec, nextPass } from './orbit.js';
@@ -26,6 +26,7 @@ const S = {
   station: { lat: CITIES[0][1], lon: CITIES[0][2], altM: CITIES[0][3] }, band: 'Ku', beacons: [], beacon: null, diameterM: 2.4,
   az: 0, el: 0, target: { az: 0, el: 0 }, frame: { az: 0, el: 0 }, lastLook: null, timeOffsetMs: 0,
   centerHz: 11.7e9, spanHz: 1e6, rbwHz: 3e3, avgN: 4, avgTrace: null, holdTrace: null, topDbm: -40, bottomDbm: -130,
+  jogMode: 'hold', jogSpeed: 0.2, held: new Map(), trackIntervalS: 10,
   ctl: null, ctlKind: null, reveal: false, beamwidth: 1, trackEma: null, passDate: null, satToken: 0,
 };
 let waterfall;
@@ -193,6 +194,7 @@ function checkVisibility() {
 }
 
 function mispoint() {
+  S.held.clear();
   stopControl();
   const l = look(S.satrec, S.station, simDate());
   S.lastLook = null;
@@ -211,10 +213,16 @@ function mispoint() {
   rescale();
 }
 
-function setStatus(text, cls = '') { const el = $('status'); el.textContent = text; el.className = cls; }
+// Skips identical writes so the live region is not re-announced every sweep.
+function setStatus(text, cls = '') {
+  const el = $('status');
+  if (el.textContent !== text) el.textContent = text;
+  if (el.className !== cls) el.className = cls;
+}
 
 function stopControl(message) {
   S.ctl = null; S.ctlKind = null;
+  $('nextCycle').textContent = '';
   $('autoPeak').classList.remove('active');
   $('stepTrack').classList.remove('active');
   if (message !== undefined) setStatus(message);
@@ -227,7 +235,7 @@ function startControl(kind) {
   const noise = noiseDbm(systemTempK(S.beacon.freqMHz), TRACK_BW_HZ);
   S.frame = { az: 0, el: 0 };
   const base = { az: S.az, el: S.el, beamwidthDeg: S.beamwidth, noiseDbm: noise };
-  S.ctl = kind === 'peak' ? createAutoPeak({ ...base, radiusDeg: Math.min(MAX_MISPOINT_DEG * 1.25, S.beamwidth * 5), dwell: 1 }) : createStepTrack(base);
+  S.ctl = kind === 'peak' ? createAutoPeak({ ...base, radiusDeg: Math.min(MAX_MISPOINT_DEG * 1.25, S.beamwidth * 5), dwell: 1 }) : createStepTrack({ ...base, dwell: 6, intervalS: S.trackIntervalS });
   S.ctlKind = kind;
   $(kind === 'peak' ? 'autoPeak' : 'stepTrack').classList.add('active');
 }
@@ -236,6 +244,37 @@ function jog(dAz, dEl) {
   if (S.ctl) stopControl('Manual control.');
   const step = +$('step').value;
   S.target = { az: wrap360(S.target.az + (dAz * step) / Math.max(0.05, Math.cos((S.target.el * Math.PI) / 180))), el: clamp(S.target.el + dEl * step, 0, 90) };
+}
+
+function holdStart(id, dir) {
+  if (S.ctl) stopControl('Manual control.');
+  S.held.set(id, dir);
+}
+
+function holdEnd(id) {
+  if (S.held.delete(id) && !S.held.size) S.target = { az: S.az, el: S.el }; // stop where it is, with no coast
+}
+
+function setJogMode(mode) {
+  S.held.clear();
+  S.target = { az: S.az, el: S.el };
+  S.jogMode = mode;
+  $('modeHold').classList.toggle('active', mode === 'hold');
+  $('modeStep').classList.toggle('active', mode === 'step');
+  $('modeHold').setAttribute('aria-pressed', mode === 'hold');
+  $('modeStep').setAttribute('aria-pressed', mode === 'step');
+  $('speedWrap').hidden = mode !== 'hold';
+  $('stepWrap').hidden = mode !== 'step';
+}
+
+function applyHeldJog(slewDegS, dt) {
+  let x = 0, y = 0;
+  for (const [a, b] of S.held.values()) { x += a; y += b; }
+  x = Math.sign(x); y = Math.sign(y);
+  const speed = Math.min(S.jogSpeed, slewDegS);
+  // Speed is true angle on the sky, so azimuth turns faster at high elevation, up to the slew limit.
+  const azRate = Math.min(speed / Math.max(0.05, Math.cos((S.el * Math.PI) / 180)), slewDegS);
+  S.target = { az: wrap360(S.target.az + x * azRate * dt), el: clamp(S.target.el + y * speed * dt, 0, 90) };
 }
 
 function blocksFor(l, gain) {
@@ -263,12 +302,14 @@ function sweep(dt) {
   }
   S.lastLook = l;
 
+  // Small wide-beam antennas slew faster, which keeps their much larger search area practical.
+  const slewDegS = clamp(S.beamwidth * 3, SLEW_DEG_S, 12);
+  S.ctl?.advance?.(dt);
   if (S.ctl) {
     const t = S.ctl.target();
     S.target = { az: wrap360(t.az + S.frame.az), el: clamp(t.el + S.frame.el, 0, 90) };
-  }
-  // Small wide-beam antennas slew faster, which keeps their much larger search area practical.
-  const maxMove = clamp(S.beamwidth * 3, SLEW_DEG_S, 12) * dt;
+  } else if (S.held.size) applyHeldJog(slewDegS, dt);
+  const maxMove = slewDegS * dt;
   const dAz = wrap180(S.target.az - S.az), dEl = S.target.el - S.el;
   S.az = wrap360(S.az + clamp(dAz, -maxMove, maxMove));
   S.el += clamp(dEl, -maxMove, maxMove);
@@ -332,6 +373,10 @@ function updateControlStatus(l) {
   } else if (S.ctl.phase === 'lost') setStatus(l.el > 0 ? 'Track lost. Signal is near the noise floor. Try auto-peak.' : 'Track lost. Satellite is below the horizon.', 'bad');
   else if (S.ctl.level !== null && S.ctl.level < expectedDbm(l) - 8) setStatus('Tracking, but well below the expected level. This may be a side lobe. Try auto-peak.', 'warn');
   else setStatus('Tracking.', 'ok');
+  if (S.ctlKind === 'track') {
+    const next = S.ctl.waiting ? `Next az/el cycle in ${Math.ceil(S.ctl.nextInS)} s` : 'Running az/el cycle…';
+    if ($('nextCycle').textContent !== next) $('nextCycle').textContent = next;
+  }
 }
 
 function render() {
@@ -460,10 +505,31 @@ function wire() {
   $('avg').addEventListener('change', (e) => { S.avgN = +e.target.value; S.avgTrace = null; });
   $('clearHold').addEventListener('click', () => { S.holdTrace = null; });
   $('recenter').addEventListener('click', () => { S.centerHz = freqHz() + (S.frameData?.shift ?? 0); $('center').value = (S.centerHz / 1e6).toFixed(3); resetTraces(); });
-  $('up').addEventListener('click', () => jog(0, 1));
-  $('down').addEventListener('click', () => jog(0, -1));
-  $('left').addEventListener('click', () => jog(-1, 0));
-  $('right').addEventListener('click', () => jog(1, 0));
+  for (const [id, dir] of Object.entries({ up: [0, 1], down: [0, -1], left: [-1, 0], right: [1, 0] })) {
+    const b = $(id);
+    b.style.touchAction = 'none';
+    b.addEventListener('pointerdown', (e) => {
+      if (S.jogMode !== 'hold' || e.button !== 0) return;
+      b.setPointerCapture(e.pointerId);
+      holdStart(id, dir);
+    });
+    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) b.addEventListener(type, () => holdEnd(id));
+    // detail 0 is a keyboard-activated click, which has no press duration to hold.
+    b.addEventListener('click', (e) => { if (S.jogMode === 'step' || e.detail === 0) jog(...dir); });
+  }
+  $('modeHold').addEventListener('click', () => setJogMode('hold'));
+  $('modeStep').addEventListener('click', () => setJogMode('step'));
+  $('jogSpeed').addEventListener('change', (e) => {
+    const v = +e.target.value;
+    if (!Number.isFinite(v) || v < 0.001 || v > 12) { e.target.value = S.jogSpeed; setStatus('Jog speed must be 0.001 to 12 °/s.', 'bad'); return; }
+    S.jogSpeed = v;
+  });
+  $('trackInterval').addEventListener('change', (e) => {
+    const v = +e.target.value;
+    if (!Number.isFinite(v) || v < 1 || v > 3600) { e.target.value = S.trackIntervalS; setStatus('Step-track interval must be 1 to 3600 s.', 'bad'); return; }
+    S.trackIntervalS = v;
+    if (S.ctlKind === 'track') S.ctl.setIntervalS(v);
+  });
   $('reveal').addEventListener('click', () => {
     S.reveal = !S.reveal;
     $('reveal').textContent = S.reveal ? 'Hide offset' : 'Reveal offset';
@@ -486,8 +552,14 @@ function wire() {
   window.addEventListener('keydown', (e) => {
     if (e.target.closest?.('input, select, textarea')) return;
     const m = { ArrowUp: [0, 1], ArrowDown: [0, -1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] }[e.key];
-    if (m) { e.preventDefault(); jog(...m); }
+    if (!m) return;
+    e.preventDefault();
+    if (S.jogMode === 'step') jog(...m);
+    else if (!e.repeat) holdStart(e.key, m);
   });
+  window.addEventListener('keyup', (e) => holdEnd(e.key));
+  // A key or pointer released while the window is unfocused would otherwise jog forever.
+  window.addEventListener('blur', () => { if (S.held.size) { S.held.clear(); S.target = { az: S.az, el: S.el }; } });
 }
 
 // Open on a satellite with real plan data that this station can actually see.

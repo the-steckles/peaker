@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { matchSatellite, nameKeys, parseBeaconCell, parseBeaconTable, parseLongitude, parseTransponders, validateTransponders } from '../scripts/parse-plans.mjs';
-import { bandOf, bandsFor, estimatedBeacon, resolveBeacons } from '../src/beacon.js';
+import { bandOf, bandsFor, estimatedBeacon, resolveBeacons } from '../src/frequencies.js';
 
 test('parses longitudes', () => {
   assert.equal(parseLongitude('72,1°E'), 72.1);

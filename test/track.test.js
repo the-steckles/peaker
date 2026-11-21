@@ -84,6 +84,24 @@ test('step-track holds a moving LEO target', () => {
   assert.ok(worst < HP * 0.6, `worst ${worst}, beamwidth ${HP}`);
 });
 
+test('step-track runs one cycle per interval and holds still between cycles', () => {
+  const rng = seeded(21);
+  const sat = { az: 100, el: 30 };
+  const read = sensor(sat, rng);
+  const t = createStepTrack({ az: 100.05, el: 30.02, beamwidthDeg: HP, noiseDbm: NOISE, dwell: 6, intervalS: 5 });
+  const dt = 1 / 30;
+  let moved = 0, previous = null;
+  for (let i = 0; i < 30 * 21; i++) {
+    t.advance(dt);
+    const p = t.target();
+    if (t.waiting && previous?.waiting && (p.az !== previous.az || p.el !== previous.el)) moved++;
+    previous = { ...p, waiting: t.waiting };
+    t.update(read(p));
+  }
+  assert.ok(t.cycles >= 4 && t.cycles <= 5, `cycles ${t.cycles}`);
+  assert.equal(moved, 0);
+});
+
 test('step-track reports loss when the target leaves the beam', () => {
   const rng = seeded(4);
   const t = createStepTrack({ az: 100, el: 30, beamwidthDeg: HP, noiseDbm: NOISE });
