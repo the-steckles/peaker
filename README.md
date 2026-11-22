@@ -29,7 +29,7 @@ Other commands:
 
 **Signal.** Received power is EIRP minus free-space and clear-sky atmospheric loss, plus antenna gain at the true off-axis angle. Noise is kTB. Doppler comes from the orbit's range rate.
 
-**Auto control.** The controllers see only measured beacon power and their own commanded position. Auto-peak runs a spiral search, moves to the strongest point and refines with three-point fits. Step-track repeats those fits continuously.
+**Auto control.** The controllers see only measured beacon power and their own commanded position. Auto-peak runs a spiral or raster search, moves to the strongest point and refines with three-point fits. Step-track repeats those fits on a configurable interval. The "How it works" panel explains each step live and plots az, el and beacon level over time.
 
 ## What is modeled rather than real
 
@@ -42,5 +42,3 @@ Other commands:
 - Orbital elements: [CelesTrak](https://celestrak.org)
 - Beacons and transponder plans: [Frequency Plan Satellites](http://frequencyplansatellites.altervista.org/)
 - Transmitters: [SatNOGS DB](https://db.satnogs.org)
-
-**Before making this repository public,** get permission from the Frequency Plan Satellites owner to redistribute the extracted data, or remove the snapshots from `public/data/` and have users generate their own. Check the SatNOGS data license too.

@@ -1,6 +1,8 @@
 import { beamwidthDeg, gainDbi, isModelReliable, offAxisDeg, peakGainDbi } from './antenna.js';
 import { BANDS, bandOf, bandsFor, resolveBeacons } from './frequencies.js';
-import { createWaterfall, drawPattern, drawSpectrum } from './display.js';
+import { createWaterfall, drawExplainer, drawHistory, drawPattern, drawSpectrum } from './display.js';
+import { describeController, describeRecord, recordView } from './explain.js';
+import { findChip, nextGroup, prevGroup } from './timeline.js';
 import { TRANSPONDER_EIRP_DBW, atmosphericLossDb, beaconEirpDbw, computeTrace, dopplerHz, fsplDb, noiseDbm, peakNear, receivedDbm, systemTempK } from './link.js';
 import { isGeostationary, look, makeSatrec, nextPass } from './orbit.js';
 import { createAutoPeak, createStepTrack } from './track.js';
@@ -26,7 +28,9 @@ const S = {
   station: { lat: CITIES[0][1], lon: CITIES[0][2], altM: CITIES[0][3] }, band: 'Ku', beacons: [], beacon: null, diameterM: 2.4,
   az: 0, el: 0, target: { az: 0, el: 0 }, frame: { az: 0, el: 0 }, lastLook: null, timeOffsetMs: 0,
   centerHz: 11.7e9, spanHz: 1e6, rbwHz: 3e3, avgN: 4, avgTrace: null, holdTrace: null, topDbm: -40, bottomDbm: -130,
-  jogMode: 'hold', jogSpeed: 0.2, held: new Map(), trackIntervalS: 10,
+  jogMode: 'hold', jogSpeed: 0.2, held: new Map(), trackIntervalS: 20, trackDwellS: 1.5, scanPattern: 'spiral',
+  history: [], historyWindowS: 30, hoverX: null, explainInfo: null, sweepCount: 0, stepsKey: null,
+  paused: false, pausedSimMs: 0, run: null, reviewIndex: 0, dirty: false,
   ctl: null, ctlKind: null, reveal: false, beamwidth: 1, trackEma: null, passDate: null, satToken: 0,
 };
 let waterfall;
@@ -34,7 +38,7 @@ let waterfall;
 const wrap360 = (a) => ((a % 360) + 360) % 360;
 const wrap180 = (a) => ((a + 540) % 360) - 180;
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-const simDate = () => new Date(Date.now() + S.timeOffsetMs);
+const simDate = () => new Date(S.paused ? S.pausedSimMs : Date.now() + S.timeOffsetMs);
 const safeUrl = (u) => { try { return ['http:', 'https:'].includes(new URL(u).protocol) ? u : null; } catch { return null; } };
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
@@ -193,9 +197,37 @@ function checkVisibility() {
     : `Below the horizon (${l.el.toFixed(1)}°) with no pass in the next 72 hours from this location.`;
 }
 
+function setPaused(paused) {
+  if (paused === S.paused) return;
+  if (paused) {
+    S.pausedSimMs = simDate().getTime();
+    S.paused = true;
+    if (S.held.size) { S.held.clear(); S.target = { az: S.az, el: S.el }; }
+    S.reviewIndex = Math.max(0, (S.run?.records.length ?? 1) - 1);
+  } else {
+    // Simulated time picks up where it stopped instead of jumping ahead.
+    S.timeOffsetMs = S.pausedSimMs - Date.now();
+    S.paused = false;
+  }
+  S.dirty = true;
+}
+
+function review(index) {
+  const n = S.run?.records.length ?? 0;
+  if (!n || index < 0) return;
+  setPaused(true);
+  S.reviewIndex = clamp(index, 0, n - 1);
+  S.dirty = true;
+}
+
 function mispoint() {
   S.held.clear();
+  S.paused = false;
+  S.run = null;
+  S.dirty = true;
   stopControl();
+  S.explainInfo = null;
+  S.history = [];
   const l = look(S.satrec, S.station, simDate());
   S.lastLook = null;
   S.frame = { az: 0, el: 0 };
@@ -223,30 +255,45 @@ function setStatus(text, cls = '') {
 function stopControl(message) {
   S.ctl = null; S.ctlKind = null;
   $('nextCycle').textContent = '';
+  // A finished result stays up to study; an interrupted run goes back to the manual explanation.
+  if (!['done', 'notfound'].includes(S.explainInfo?.phase)) S.explainInfo = null;
   $('autoPeak').classList.remove('active');
   $('stepTrack').classList.remove('active');
   if (message !== undefined) setStatus(message);
   else setStatus('');
 }
 
+const dwellSweeps = () => Math.max(1, Math.round(S.trackDwellS / SWEEP_S));
+
+function showCycleNote() {
+  const cycle = S.trackDwellS * 6; // three points on each of two axes
+  $('cycleNote').textContent = cycle >= S.trackIntervalS
+    ? `One cycle takes about ${cycle.toFixed(1)} s, so cycles run back to back.`
+    : `One cycle takes about ${cycle.toFixed(1)} s, then it holds until the next.`;
+}
+
 function startControl(kind) {
+  setPaused(false);
   if (S.ctlKind === kind) { stopControl('Stopped.'); return; }
   stopControl();
   const noise = noiseDbm(systemTempK(S.beacon.freqMHz), TRACK_BW_HZ);
   S.frame = { az: 0, el: 0 };
   const base = { az: S.az, el: S.el, beamwidthDeg: S.beamwidth, noiseDbm: noise };
-  S.ctl = kind === 'peak' ? createAutoPeak({ ...base, radiusDeg: Math.min(MAX_MISPOINT_DEG * 1.25, S.beamwidth * 5), dwell: 1 }) : createStepTrack({ ...base, dwell: 6, intervalS: S.trackIntervalS });
+  S.ctl = kind === 'peak' ? createAutoPeak({ ...base, radiusDeg: Math.min(MAX_MISPOINT_DEG * 1.25, S.beamwidth * 5), dwell: 1, pattern: S.scanPattern }) : createStepTrack({ ...base, dwell: dwellSweeps(), intervalS: S.trackIntervalS });
   S.ctlKind = kind;
+  S.run = S.ctl.run;
   $(kind === 'peak' ? 'autoPeak' : 'stepTrack').classList.add('active');
 }
 
 function jog(dAz, dEl) {
+  if (S.paused) return;
   if (S.ctl) stopControl('Manual control.');
   const step = +$('step').value;
   S.target = { az: wrap360(S.target.az + (dAz * step) / Math.max(0.05, Math.cos((S.target.el * Math.PI) / 180))), el: clamp(S.target.el + dEl * step, 0, 90) };
 }
 
 function holdStart(id, dir) {
+  if (S.paused) return;
   if (S.ctl) stopControl('Manual control.');
   S.held.set(id, dir);
 }
@@ -347,13 +394,67 @@ function sweep(dt) {
   const ema = 10 ** (trackDbm / 10);
   S.trackEma = S.trackEma === null ? ema : S.trackEma + (ema - S.trackEma) * 0.25;
 
-  if (S.ctl && arrived) S.ctl.update(trackDbm);
+  if (S.ctl && arrived) {
+    S.ctl.update(trackDbm);
+    const { records } = S.ctl.run;
+    for (let i = records.length - 1; i >= 0 && !records[i].t; i--) {
+      records[i].t = date.getTime();
+      records[i].frame = { ...S.frame };
+    }
+  }
+  if (S.ctl) S.explainInfo = S.ctl.explain;
+  if (++S.sweepCount % 3 === 0) recordHistory(date.getTime(), l, 10 * Math.log10(S.trackEma));
   updateControlStatus(l);
 
   const expected = expectedDbm(l);
   const window = Math.max(S.rbwHz * 2, S.spanHz / 200);
   S.frameData = { shown, marker: peakNear(shown, S.centerHz, S.spanHz, shift(f), window), l, off, expected, shift: shift(f) - f, trackNoiseDb: 10 * Math.log10(trackNoise) };
   waterfall.push(shown, S.bottomDbm, S.topDbm - 10);
+}
+
+function recordHistory(t, l, db) {
+  const info = S.ctl ? S.explainInfo : null;
+  const phase = !info ? null : info.phase === 'search' ? 'search' : info.phase === 'hold' ? 'hold' : 'measure';
+  S.history.push({ t, az: S.az, el: S.el, db, satAz: l.az, satEl: l.el, phase });
+  while (S.history.length && S.history[0].t < t - 600e3) S.history.shift();
+}
+
+function renderExplainer() {
+  const records = S.run?.records ?? [];
+  const rec = S.paused ? records[S.reviewIndex] : null;
+  const d = rec ? describeRecord(S.run, rec) : describeController(S.explainInfo);
+  const key = d.steps.join('|');
+  const list = $('ctlSteps');
+  if (S.stepsKey !== key) {
+    S.stepsKey = key;
+    list.replaceChildren(...d.steps.map((s, i) => {
+      const li = document.createElement('li');
+      const b = document.createElement('button');
+      b.textContent = s;
+      b.dataset.chip = i;
+      li.append(b);
+      return li;
+    }));
+  }
+  [...list.querySelectorAll('button')].forEach((b, i) => {
+    const cls = i === d.active ? 'now' : i < d.active ? 'past' : '';
+    if (b.className !== cls) b.className = cls;
+    if (i === d.active) b.setAttribute('aria-current', 'step'); else b.removeAttribute('aria-current');
+  });
+  if ($('ctlTitle').textContent !== d.title) $('ctlTitle').textContent = d.title;
+  if ($('ctlText').textContent !== d.text) $('ctlText').textContent = d.text;
+  drawExplainer($('explainPlot'), rec ? recordView(S.run, rec) : S.explainInfo);
+
+  const pauseLabel = S.paused ? 'Resume' : 'Pause';
+  if ($('pause').textContent !== pauseLabel) $('pause').textContent = pauseLabel;
+  $('pause').classList.toggle('active', S.paused);
+  const reviewing = S.paused && records.length > 0;
+  for (const id of ['prevGroup', 'prevStep', 'nextStep', 'nextGroup', 'reviewSlider']) $(id).disabled = !reviewing;
+  const slider = $('reviewSlider');
+  slider.max = Math.max(0, records.length - 1);
+  slider.value = reviewing ? S.reviewIndex : slider.max;
+  const pos = reviewing ? `${S.reviewIndex + 1} / ${records.length}` : records.length ? `${records.length} saved` : '';
+  if ($('reviewPos').textContent !== pos) $('reviewPos').textContent = pos;
 }
 
 function updateControlStatus(l) {
@@ -385,6 +486,14 @@ function render() {
   drawSpectrum($('spectrum'), { trace: d.shown, hold: S.holdTrace, centerHz: S.centerHz, spanHz: S.spanHz, topDbm: S.topDbm, bottomDbm: S.bottomDbm, marker: d.marker });
   waterfall.draw(S.centerHz, S.spanHz);
   drawPattern($('patternPlot'), { diameterM: S.diameterM, freqHz: freqHz(), beamwidth: S.beamwidth, offAxis: S.reveal ? d.off : null });
+  renderExplainer();
+  const histNote = S.reveal ? "Dashed line: the satellite's true position." : "Reveal the offset to overlay the satellite's true position as a dashed line.";
+  if ($('histNote').textContent !== histNote) $('histNote').textContent = histNote;
+  const nowMs = simDate().getTime();
+  const cursorT = S.paused ? S.run?.records[S.reviewIndex]?.t ?? null : null;
+  // Widen the view while reviewing so the selected reading stays on the plot.
+  const windowS = cursorT === null ? S.historyWindowS : Math.max(S.historyWindowS, Math.min(600, Math.ceil(((nowMs - cursorT) / 1000) * 1.1)));
+  drawHistory($('history'), { samples: S.history, windowS, nowMs, showSat: S.reveal, hoverX: S.hoverX, cursorT });
   const level = 10 * Math.log10(S.trackEma);
   $('level').textContent = `${level.toFixed(1)} dBm`;
   $('rCn').textContent = `${(level - d.trackNoiseDb).toFixed(1)} dB`;
@@ -402,9 +511,10 @@ function loop(now) {
   last = now;
   debt += dt;
   let n = 0;
+  if (S.paused) debt = 0;
   while (debt >= SWEEP_S && n++ < 4) { sweep(SWEEP_S); debt -= SWEEP_S; }
   if (n >= 4) debt = 0;
-  if (n) render();
+  if (n || S.dirty) { S.dirty = false; render(); }
   requestAnimationFrame(loop);
 }
 
@@ -517,6 +627,21 @@ function wire() {
     // detail 0 is a keyboard-activated click, which has no press duration to hold.
     b.addEventListener('click', (e) => { if (S.jogMode === 'step' || e.detail === 0) jog(...dir); });
   }
+  $('histWindow').addEventListener('change', (e) => { S.historyWindowS = +e.target.value; });
+  $('history').addEventListener('pointermove', (e) => { S.hoverX = e.clientX - e.currentTarget.getBoundingClientRect().left; S.dirty = true; });
+  $('history').addEventListener('pointerleave', () => { S.hoverX = null; S.dirty = true; });
+  $('pause').addEventListener('click', () => setPaused(!S.paused));
+  $('prevStep').addEventListener('click', () => review(S.reviewIndex - 1));
+  $('nextStep').addEventListener('click', () => review(S.reviewIndex + 1));
+  $('prevGroup').addEventListener('click', () => review(prevGroup(S.run.records, S.reviewIndex)));
+  $('nextGroup').addEventListener('click', () => review(nextGroup(S.run.records, S.reviewIndex)));
+  $('reviewSlider').addEventListener('input', (e) => review(+e.target.value));
+  $('ctlSteps').addEventListener('click', (e) => {
+    const chip = e.target.closest('button')?.dataset.chip;
+    if (chip === undefined || !S.run?.records.length) return;
+    const from = S.paused ? S.reviewIndex : S.run.records.length - 1;
+    review(findChip(S.run, from, +chip));
+  });
   $('modeHold').addEventListener('click', () => setJogMode('hold'));
   $('modeStep').addEventListener('click', () => setJogMode('step'));
   $('jogSpeed').addEventListener('change', (e) => {
@@ -529,7 +654,17 @@ function wire() {
     if (!Number.isFinite(v) || v < 1 || v > 3600) { e.target.value = S.trackIntervalS; setStatus('Step-track interval must be 1 to 3600 s.', 'bad'); return; }
     S.trackIntervalS = v;
     if (S.ctlKind === 'track') S.ctl.setIntervalS(v);
+    showCycleNote();
   });
+  $('trackDwell').addEventListener('change', (e) => {
+    const v = +e.target.value;
+    if (!Number.isFinite(v) || v < 0.1 || v > 30) { e.target.value = S.trackDwellS; setStatus('Time per point must be 0.1 to 30 s.', 'bad'); return; }
+    S.trackDwellS = v;
+    if (S.ctlKind === 'track') S.ctl.setDwell(dwellSweeps());
+    showCycleNote();
+  });
+  $('scanPattern').addEventListener('change', (e) => { S.scanPattern = e.target.value === 'raster' ? 'raster' : 'spiral'; });
+  showCycleNote();
   $('reveal').addEventListener('click', () => {
     S.reveal = !S.reveal;
     $('reveal').textContent = S.reveal ? 'Hide offset' : 'Reveal offset';
@@ -554,6 +689,10 @@ function wire() {
     const m = { ArrowUp: [0, 1], ArrowDown: [0, -1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] }[e.key];
     if (!m) return;
     e.preventDefault();
+    if (S.paused) {
+      if (m[0]) review(S.reviewIndex + m[0]); // left and right step through readings while paused
+      return;
+    }
     if (S.jogMode === 'step') jog(...m);
     else if (!e.repeat) holdStart(e.key, m);
   });

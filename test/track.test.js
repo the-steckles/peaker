@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { beamwidthDeg, gainDbi, offAxisDeg } from '../src/antenna.js';
-import { createAutoPeak, createStepTrack, parabolicOffset, spiralPoints } from '../src/track.js';
+import { createAutoPeak, createStepTrack, parabolicOffset, rasterPoints, spiralPoints } from '../src/track.js';
+import { describeController } from '../src/explain.js';
 
 const D = 2.4, F = 11.7e9, HP = beamwidthDeg(D, F);
 const NOISE = -100;
@@ -21,9 +22,9 @@ function sensor(sat, rng) {
   };
 }
 
-function runPeak(start, sat, seed) {
+function runPeak(start, sat, seed, pattern = 'spiral') {
   const read = sensor(sat, seeded(seed));
-  const c = createAutoPeak({ ...start, beamwidthDeg: HP, radiusDeg: 3, noiseDbm: NOISE });
+  const c = createAutoPeak({ ...start, beamwidthDeg: HP, radiusDeg: 3, noiseDbm: NOISE, pattern });
   for (let i = 0; i < 20000 && !['done', 'notfound'].includes(c.phase); i++) c.update(read(c.target()));
   return { phase: c.phase, error: offAxisDeg(c.target().az, c.target().el, sat.az, sat.el) };
 }
@@ -100,6 +101,73 @@ test('step-track runs one cycle per interval and holds still between cycles', ()
   }
   assert.ok(t.cycles >= 4 && t.cycles <= 5, `cycles ${t.cycles}`);
   assert.equal(moved, 0);
+});
+
+test('explainer follows auto-peak through every phase', () => {
+  const sat = { az: 180, el: 40 };
+  const read = sensor(sat, seeded(8));
+  const c = createAutoPeak({ az: 180.6, el: 40.5, beamwidthDeg: HP, radiusDeg: 3, noiseDbm: NOISE });
+  const seen = new Set();
+  for (let i = 0; i < 20000 && c.phase !== 'done'; i++) {
+    seen.add(describeController(c.explain).steps[describeController(c.explain).active]);
+    c.update(read(c.target()));
+  }
+  seen.add(describeController(c.explain).steps[describeController(c.explain).active]);
+  assert.deepEqual([...seen], ['Spiral search', 'Refine', 'Peaked']);
+  assert.ok(c.explain.scan.fits.az && c.explain.scan.fits.el);
+  assert.ok(Number.isFinite(c.explain.measured[c.explain.bestIndex]));
+});
+
+test('explainer names each step-track point in order, then holds', () => {
+  const sat = { az: 100, el: 30 };
+  const read = sensor(sat, seeded(9));
+  const t = createStepTrack({ az: 100, el: 30, beamwidthDeg: HP, noiseDbm: NOISE, dwell: 2, intervalS: 60 });
+  const order = [];
+  for (let i = 0; i < 20; i++) {
+    t.advance(1 / 30);
+    const d = describeController(t.explain);
+    if (order.at(-1) !== d.steps[d.active]) order.push(d.steps[d.active]);
+    t.update(read(t.target()));
+  }
+  assert.deepEqual(order, ['Az center', 'Az −', 'Az +', 'El center', 'El −', 'El +', 'Hold']);
+  assert.match(describeController(t.explain).title, /Holding: next cycle in \d+ s/);
+});
+
+test('raster covers its square in connected back-and-forth rows', () => {
+  const s = 0.4, pts = rasterPoints(3, s);
+  for (let i = 1; i < pts.length; i++) assert.ok(Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y) <= s + 1e-9);
+  for (let x = -3; x <= 3; x += 0.25) for (let y = -3; y <= 3; y += 0.25) {
+    assert.ok(Math.min(...pts.map((p) => Math.hypot(p.x - x, p.y - y))) <= s * Math.SQRT1_2 + 1e-9);
+  }
+});
+
+test('raster auto-peak reaches the main lobe, including from a side lobe', () => {
+  for (let seed = 1; seed <= 6; seed++) {
+    const sat = { az: 120, el: 40 };
+    const start = { az: sat.az, el: sat.el + HP * (seed === 1 ? 1.65 : 0.5 + seed * 0.4) };
+    const res = runPeak(start, sat, seed, 'raster');
+    assert.equal(res.phase, 'done');
+    assert.ok(res.error < 0.1 * HP, `seed ${seed}: error ${res.error}`);
+  }
+  const c = createAutoPeak({ az: 10, el: 40, beamwidthDeg: HP, radiusDeg: 1, noiseDbm: NOISE, pattern: 'raster' });
+  assert.equal(describeController(c.explain).steps[0], 'Raster scan');
+});
+
+test('time per point sets how long a step-track cycle takes', () => {
+  const read = sensor({ az: 100, el: 30 }, seeded(5));
+  const sweepsPerCycle = (dwell, change) => {
+    const t = createStepTrack({ az: 100, el: 30, beamwidthDeg: HP, noiseDbm: NOISE, dwell: 2, intervalS: 1000 });
+    if (change) t.setDwell(dwell);
+    let n = 0;
+    while (t.cycles === 0 && n < 1000) { t.update(read(t.target())); n++; }
+    return n;
+  };
+  assert.equal(sweepsPerCycle(2, false), 12);
+  assert.equal(sweepsPerCycle(45, true), 270); // 1.5 s per point at 30 sweeps per second
+});
+
+test('explainer has a manual description', () => {
+  assert.equal(describeController(null).title, 'Manual pointing');
 });
 
 test('step-track reports loss when the target leaves the beam', () => {
