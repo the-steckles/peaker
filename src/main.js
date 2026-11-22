@@ -495,11 +495,11 @@ function render() {
   const windowS = cursorT === null ? S.historyWindowS : Math.max(S.historyWindowS, Math.min(600, Math.ceil(((nowMs - cursorT) / 1000) * 1.1)));
   drawHistory($('history'), { samples: S.history, windowS, nowMs, showSat: S.reveal, hoverX: S.hoverX, cursorT });
   const level = 10 * Math.log10(S.trackEma);
-  $('level').textContent = `${level.toFixed(1)} dBm`;
+  $('level').textContent = $('dockLevel').textContent = `${level.toFixed(1)} dBm`;
   $('rCn').textContent = `${(level - d.trackNoiseDb).toFixed(1)} dB`;
   $('rExpected').textContent = d.l.el > 0 ? `${d.expected.toFixed(1)} dBm` : 'below horizon';
-  $('rAz').textContent = `${S.az.toFixed(3)}°`;
-  $('rEl').textContent = `${S.el.toFixed(3)}°`;
+  $('rAz').textContent = $('dockAz').textContent = `${S.az.toFixed(3)}°`;
+  $('rEl').textContent = $('dockEl').textContent = `${S.el.toFixed(3)}°`;
   if (S.reveal) $('rOff').textContent = `${d.off.toFixed(3)}° (sat ${d.l.az.toFixed(2)}, ${d.l.el.toFixed(2)})`;
   $('rRange').textContent = `${Math.round(d.l.rangeKm).toLocaleString()} km`;
   $('rDoppler').textContent = `${(d.shift / 1000).toFixed(2)} kHz`;
@@ -618,17 +618,21 @@ function wire() {
   for (const [id, dir] of Object.entries({ up: [0, 1], down: [0, -1], left: [-1, 0], right: [1, 0] })) {
     const b = $(id);
     b.style.touchAction = 'none';
+    b.addEventListener('contextmenu', (e) => e.preventDefault()); // A long press would otherwise end the hold.
     b.addEventListener('pointerdown', (e) => {
       if (S.jogMode !== 'hold' || e.button !== 0) return;
       b.setPointerCapture(e.pointerId);
+      b.classList.add('held');
       holdStart(id, dir);
     });
-    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) b.addEventListener(type, () => holdEnd(id));
+    // Stops the phone's long-press gesture. Step mode still needs the tap's click.
+    b.addEventListener('touchstart', (e) => { if (S.jogMode === 'hold') e.preventDefault(); }, { passive: false });
+    for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) b.addEventListener(type, () => { b.classList.remove('held'); holdEnd(id); });
     // detail 0 is a keyboard-activated click, which has no press duration to hold.
     b.addEventListener('click', (e) => { if (S.jogMode === 'step' || e.detail === 0) jog(...dir); });
   }
   $('histWindow').addEventListener('change', (e) => { S.historyWindowS = +e.target.value; });
-  $('history').addEventListener('pointermove', (e) => { S.hoverX = e.clientX - e.currentTarget.getBoundingClientRect().left; S.dirty = true; });
+  for (const type of ['pointerdown', 'pointermove']) $('history').addEventListener(type, (e) => { S.hoverX = e.clientX - e.currentTarget.getBoundingClientRect().left; S.dirty = true; });
   $('history').addEventListener('pointerleave', () => { S.hoverX = null; S.dirty = true; });
   $('pause').addEventListener('click', () => setPaused(!S.paused));
   $('prevStep').addEventListener('click', () => review(S.reviewIndex - 1));

@@ -28,7 +28,9 @@ function freqAxis(p, centerHz, spanHz) {
   const { ctx, pw, h } = p;
   ctx.fillStyle = C.axis;
   ctx.textAlign = 'center';
-  for (let i = 0; i <= 4; i++) {
+  // The edge labels hang inward, so the first gap must fit one and a half labels.
+  const every = 1.5 * ctx.measureText(formatMHz(centerHz, spanHz)).width + 8 > pw / 4 ? 2 : 1;
+  for (let i = 0; i <= 4; i += every) {
     const f = centerHz - spanHz / 2 + (spanHz * i) / 4;
     ctx.textAlign = i === 0 ? 'left' : i === 4 ? 'right' : 'center';
     ctx.fillText(formatMHz(f, spanHz), M.l + (pw * i) / 4, h - 9);
